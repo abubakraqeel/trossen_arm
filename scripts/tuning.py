@@ -359,11 +359,17 @@ def build_sidebar(
     cur_val: float,
     char_name: str,
     orig_val: float | None = None,
+    all_free: bool = False,
 ) -> Panel:
     """Build the sidebar panel."""
     label, unit = CHAR_INFO[char_name]
     t = Text()
 
+    t.append("   Free:   ", style="bold")
+    if all_free:
+        t.append("ALL joints\n", style="bold black on yellow")
+    else:
+        t.append(f"Joint {joint_idx} only\n", style="bold cyan")
     t.append("   Joint:  ", style="bold")
     t.append(f"Joint {joint_idx}\n", style="bold cyan")
     t.append("   Characteristic:\n", style="bold")
@@ -426,6 +432,7 @@ FOOTER_ITEMS = (
     ("w/s", "nudge"),
     ("W/S", "10x"),
     ("+/-", "increment"),
+    ("a", "all free (hold arm)"),
     ("r", "refresh"),
     ("q/Esc", "quit"),
 )
@@ -444,8 +451,17 @@ def tuning_phase(driver: trossen_arm.TrossenArmDriver, num_joints: int) -> None:
     joint_idx = 0
     char_idx = CHARACTERISTICS.index("friction_constant_term")
     increment = DEFAULT_INCREMENT
+    # dual-arm-vla fork: 'a' toggles gravity compensation on all joints, as the
+    # leaders run in teleoperation, so the arm can be placed in a working pose
+    # by hand and tested as a whole. Toggling back brakes the other joints where
+    # they are. No position commands are sent in either mode.
+    all_free = False
 
     def apply_joint_mode():
+        if all_free:
+            driver.set_all_modes(trossen_arm.Mode.external_effort)
+            driver.set_all_external_efforts([0.0] * num_joints, 0.0, False)
+            return
         modes = [trossen_arm.Mode.idle] * num_joints
         modes[joint_idx] = trossen_arm.Mode.external_effort
         driver.set_joint_modes(modes)
@@ -487,6 +503,7 @@ def tuning_phase(driver: trossen_arm.TrossenArmDriver, num_joints: int) -> None:
                     cur_val,
                     char_name,
                     orig_val,
+                    all_free,
                 ),
                 name="sidebar",
                 size=42,
@@ -518,6 +535,11 @@ def tuning_phase(driver: trossen_arm.TrossenArmDriver, num_joints: int) -> None:
             return
 
         if key == "r":
+            continue
+
+        if key == "a":
+            all_free = not all_free
+            apply_joint_mode()
             continue
 
         # Navigate grid: arrows move joint (row) and characteristic (column)

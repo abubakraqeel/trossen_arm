@@ -20,3 +20,7 @@ dual-arm-vla thesis project:
 - `--restore <file.json>` writes a backup back to the arm it was saved from. It asks for
   confirmation first and verifies the values by reading them back.
 - It holds the project hardware lock (`outputs/lerobot_hardware.lock`) while it runs.
+- The `a` key toggles gravity compensation on all joints, as the leaders run in
+  teleoperation. Use it to place the arm in a working pose by hand and to test the whole
+  arm. Pressing `a` again brakes all joints except the selected one where they are. `w`/`s`
+  still tune the selected joint in either mode. Hold the arm when toggling.
