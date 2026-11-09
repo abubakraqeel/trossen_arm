@@ -26,31 +26,44 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-# /// script
-# requires-python = ">=3.10"
-# dependencies = [
-#     "readchar>=4.0",
-#     "rich>=13.0",
-#     "trossen_arm>=1.9",
-# ]
-# ///
+# dual-arm-vla fork: the upstream inline script metadata (trossen_arm>=1.9) was
+# removed. With it, `uv run tuning.py` built a throwaway environment with the
+# latest driver, which may not match the controller firmware. Dependencies
+# (trossen-arm, readchar, rich) now come from the environment the script runs in,
+# e.g. the thesis project's locked .venv.
 
 """
 Joint Characteristic Tuning
 
-Run with:
-    uv run tuning.py [--ip 192.168.1.2]
+Run with (from the dual-arm-vla project root):
+    uv run third_party/trossen_arm/scripts/tuning.py [--ip 192.168.1.3]
+    uv run third_party/trossen_arm/scripts/tuning.py --restore <backup.json>
 
 Setup:  Arrow keys to navigate, Left/Right to change selections, Enter to confirm.
 Tuning: Arrow keys to navigate the grid, w/s to nudge value, W/S for 10x nudge,
         +/- to double/halve increment, r to refresh, q or Esc to quit.
+
+dual-arm-vla fork additions:
+  - Joint characteristics persist across controller reboots, so after connecting
+    the script saves the current values to a JSON backup before any change, and
+    saves the tuned values again on exit if they changed.
+  - --restore writes a backup back to the arm it came from, after confirmation,
+    and verifies the result by read-back.
+  - Inside the dual-arm-vla project it holds the project hardware lock
+    (outputs/lerobot_hardware.lock) and refuses to start while another project
+    hardware session is active.
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
+import fcntl
+import json
 import logging
 import os
+from pathlib import Path
+import sys
 import termios
 
 import readchar
@@ -103,7 +116,123 @@ END_EFFECTORS = (
 
 DEFAULT_INCREMENT = 1e-3
 
+# dual-arm-vla fork: backup, restore and project hardware lock.
+# This file lives at <project>/third_party/trossen_arm/scripts/tuning.py.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+IN_PROJECT = (PROJECT_ROOT / "pyproject.toml").is_file() and (
+    PROJECT_ROOT / "third_party" / "trossen_arm"
+).is_dir()
+DEFAULT_BACKUP_DIR = (
+    PROJECT_ROOT / "configs" / "joint_characteristics"
+    if IN_PROJECT
+    else Path.cwd() / "joint_characteristics"
+)
+DEFAULT_LOCK_FILE = (
+    PROJECT_ROOT / "outputs" / "lerobot_hardware.lock" if IN_PROJECT else None
+)
+
 console = Console()
+
+
+def chars_to_dicts(chars) -> list[dict[str, float]]:
+    return [{name: getattr(jc, name) for name in CHARACTERISTICS} for jc in chars]
+
+
+def save_characteristics(
+    driver: trossen_arm.TrossenArmDriver,
+    ip: str,
+    end_effector: str,
+    backup_dir: Path,
+    label: str,
+) -> Path:
+    """Write the arm's current joint characteristics to a timestamped JSON file."""
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now()
+    path = backup_dir / f"wxai_v0_{ip}_{now:%Y%m%d_%H%M%S}_{label}.json"
+    record = {
+        "ip": ip,
+        "end_effector": end_effector,
+        "label": label,
+        "saved_at": now.isoformat(timespec="seconds"),
+        "driver_version": driver.get_driver_version(),
+        "controller_version": driver.get_controller_version(),
+        "joint_characteristics": chars_to_dicts(driver.get_joint_characteristics()),
+    }
+    path.write_text(json.dumps(record, indent=2) + "\n")
+    return path
+
+
+def acquire_lock(lock_file: Path | None):
+    """Hold the project hardware lock; returns the open file (keep it referenced)."""
+    if lock_file is None:
+        return None
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_file.open("a")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise SystemExit(
+            "Another project hardware session is active "
+            f"({lock_file}); end it before tuning. No arm connection was opened."
+        )
+    return handle
+
+
+def restore_characteristics(path: Path, cli_ip: str | None) -> None:
+    """Write a backup file's joint characteristics to its own arm, then verify."""
+    record = json.loads(path.read_text())
+    ip = record["ip"]
+    if cli_ip is not None and cli_ip != ip:
+        raise SystemExit(
+            f"{path} was saved from {ip}, not {cli_ip}; "
+            "joint characteristics are calibrated per arm."
+        )
+    ee_lookup = dict(END_EFFECTORS)
+    if record.get("end_effector") not in ee_lookup:
+        raise SystemExit(f"Unknown end effector in {path}: {record.get('end_effector')}")
+    target = record["joint_characteristics"]
+
+    driver = trossen_arm.TrossenArmDriver()
+    print(f"Connecting {ip} ({record['end_effector']})...")
+    driver.configure(trossen_arm.Model.wxai_v0, ee_lookup[record["end_effector"]], ip, False)
+    try:
+        current = driver.get_joint_characteristics()
+        if len(current) != len(target):
+            raise SystemExit(
+                f"Joint count mismatch: file {len(target)}, controller {len(current)}"
+            )
+        changes = [
+            (i, name, getattr(current[i], name), target[i][name])
+            for i in range(len(target))
+            for name in CHARACTERISTICS
+            if getattr(current[i], name) != target[i][name]
+        ]
+        if not changes:
+            print("Controller already matches the file; nothing written.")
+            return
+        for i, name, old, new in changes:
+            print(f"  joint {i} {name}: {old:.6g} -> {new:.6g}")
+        if not sys.stdin.isatty():
+            raise SystemExit("Run --restore in an interactive terminal.")
+        input(f"Press Enter to write these values to {ip}, or Ctrl+C to cancel: ")
+        for jc, values in zip(current, target):
+            for name in CHARACTERISTICS:
+                setattr(jc, name, values[name])
+        driver.set_joint_characteristics(current)
+        readback = chars_to_dicts(driver.get_joint_characteristics())
+        bad = [
+            (i, name)
+            for i in range(len(target))
+            for name in CHARACTERISTICS
+            if abs(readback[i][name] - target[i][name])
+            > 1e-6 * max(1.0, abs(target[i][name]))
+        ]
+        if bad:
+            raise RuntimeError(f"Read-back differs from {path} at {bad}")
+        print("Restored and verified by read-back.")
+    finally:
+        driver.cleanup()
 
 
 def clamp(val: float, lo: float, hi: float) -> float:
@@ -162,8 +291,10 @@ def render_setup(
     return Panel(lines, title="Setup", border_style="blue", expand=False, width=60)
 
 
-def setup_phase(cli_ip: str | None = None) -> tuple[trossen_arm.TrossenArmDriver, int]:
-    """Run the interactive setup. Returns (driver, num_joints)."""
+def setup_phase(
+    cli_ip: str | None = None,
+) -> tuple[trossen_arm.TrossenArmDriver, int, str, str]:
+    """Run the interactive setup. Returns (driver, num_joints, ip, end effector name)."""
     ee_idx = 1
     ip_str = cli_ip or "192.168.1.2"
     clear_error = False
@@ -197,7 +328,7 @@ def setup_phase(cli_ip: str | None = None) -> tuple[trossen_arm.TrossenArmDriver
                         clear_error,
                     )
                     num_joints = driver.get_num_joints()
-                    return driver, num_joints
+                    return driver, num_joints, ip_str, END_EFFECTORS[ee_idx][0]
                 except Exception as exc:
                     error_msg = str(exc)
             else:
@@ -424,12 +555,38 @@ def tuning_phase(driver: trossen_arm.TrossenArmDriver, num_joints: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Joint Characteristic Finetuning TUI")
     parser.add_argument("--ip", type=str, default=None, help="Robot IP address")
+    parser.add_argument(
+        "--restore", type=Path, default=None, metavar="BACKUP_JSON",
+        help="Write a saved backup back to its arm (asks for confirmation), then exit",
+    )
+    parser.add_argument(
+        "--backup-dir", type=Path, default=DEFAULT_BACKUP_DIR,
+        help=f"Where backups are written (default: {DEFAULT_BACKUP_DIR})",
+    )
+    parser.add_argument(
+        "--lock-file", type=Path, default=DEFAULT_LOCK_FILE,
+        help="Exclusive hardware lock to hold while connected "
+             f"(default: {DEFAULT_LOCK_FILE or 'none outside dual-arm-vla'})",
+    )
     args = parser.parse_args()
 
+    lock = acquire_lock(args.lock_file)  # noqa: F841 (held until exit)
+
+    if args.restore is not None:
+        restore_characteristics(args.restore, args.ip)
+        return
+
     driver = None
+    ip = end_effector = None
+    before = None
+    messages: list[str] = []
     console.set_alt_screen(True)
     try:
-        driver, num_joints = setup_phase(cli_ip=args.ip)
+        driver, num_joints, ip, end_effector = setup_phase(cli_ip=args.ip)
+        # Back up before anything can change; no backup, no tuning.
+        path = save_characteristics(driver, ip, end_effector, args.backup_dir, "before")
+        before = chars_to_dicts(driver.get_joint_characteristics())
+        messages.append(f"Saved values before tuning: {path}")
         # Check terminal size and warn if too small
         cols, rows = os.get_terminal_size()
         min_cols, min_rows = 160, 30
@@ -447,12 +604,25 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if driver is not None and before is not None:
+            try:
+                if chars_to_dicts(driver.get_joint_characteristics()) != before:
+                    path = save_characteristics(
+                        driver, ip, end_effector, args.backup_dir, "after"
+                    )
+                    messages.append(f"Saved tuned values: {path}")
+                else:
+                    messages.append("No values changed; no 'after' file written.")
+            except Exception as exc:
+                messages.append(f"WARNING: could not save tuned values: {exc}")
         console.set_alt_screen(False)
         if driver is not None:
             try:
                 driver.cleanup()
             except Exception:
                 pass
+        for message in messages:
+            print(message)
 
 
 if __name__ == "__main__":
